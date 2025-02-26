@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-from typing import Tuple, Any, Union
+from typing import Tuple, Any, Union, cast
+from datetime import datetime
+from pathlib import Path
 
 from nonebot import on_regex, on_command, on_message
 from nonebot.adapters.onebot.v11 import (Message, Bot,
@@ -8,13 +10,14 @@ from nonebot.adapters.onebot.v11 import (Message, Bot,
                                          GroupMessageEvent,
                                          PrivateMessageEvent)
 from nonebot.log import logger
-from nonebot.matcher import Matcher
+from nonebot.matcher import Matcher, current_bot
 from nonebot.params import CommandArg, RegexGroup, Arg
 from nonebot.plugin import PluginMetadata
 from nonebot.rule import Rule
+import httpx
 
 from .config import Config
-from .data_source import nncm, ncm_config, setting, Q, cmd
+from .data_source import nncm, ncm_config, setting, Q, cmd, music
 
 __plugin_meta__ = PluginMetadata(
     name="网易云无损音乐下载",
@@ -120,17 +123,87 @@ async def search_receive(matcher: Matcher, args: Message = CommandArg()):
 
 @search.got("song", prompt="要点什么歌捏?")
 async def receive_song(bot: Bot,
-                       event: Union[GroupMessageEvent, PrivateMessageEvent],
-                       song: Message = Arg(),
-                       ):
-    _id = await nncm.search_song(keyword=song.extract_plain_text(), limit=1)
+                      event: Union[GroupMessageEvent, PrivateMessageEvent],
+                      song: Message = Arg(),
+                      ):
+    keyword = song.extract_plain_text()
+    logger.info(f"收到点歌请求，关键词: {keyword}")
+    
+    _id = await nncm.search_song(keyword=keyword, limit=1)
+    logger.info(f"搜索到歌曲ID: {_id}")
+    
+    # 先发送网易云卡片
     message_id = await bot.send(event=event, message=Message(MessageSegment.music(type_="163", id_=_id)))
     nncm.get_song(message_id=message_id["message_id"], nid=_id)
-    # try:
 
-    # except ActionFailed as e:
-    #    logger.error(e.info)
-    #    await search.finish(event=event, message=f"[WARNING]: 网易云卡片消息发送失败: 账号可能被风控")
+    audio_content = None  # 用于存储音频内容
+
+    try:
+        # 检查缓存
+        info = music.search(Q["id"] == _id)
+        if info:
+            logger.info(f"找到缓存文件: {info[0]['file']}")
+            try:
+                with open(info[0]["file"], "rb") as f:
+                    audio_content = f.read()
+                logger.info("成功读取缓存文件")
+            except FileNotFoundError:
+                logger.warning(f"缓存文件不存在，将重新下载: {info[0]['file']}")
+
+        if not audio_content:  # 如果没有从缓存获取到内容
+            # 没有缓存，下载新文件
+            logger.info("开始获取歌曲详情")
+            data = nncm.get_detail([_id])[0]
+            logger.debug(f"歌曲详情: {data}")
+            
+            if data["code"] == 404:
+                logger.error("未从网易云读取到下载地址")
+                return
+                
+            url = data["url"]
+            logger.info(f"获取到下载地址: {url}")
+            
+            # 直接使用 httpx 下载文件到指定目录
+            async with httpx.AsyncClient() as client:
+                logger.info("开始下载音频文件")
+                response = await client.get(url)
+                if response.status_code == 200:
+                    # 确保音乐目录存在
+                    music_dir = Path("music")
+                    music_dir.mkdir(exist_ok=True)
+                    
+                    # 使用音乐ID作为文件名
+                    file_path = music_dir / f"{_id}.{data['type']}"
+                    logger.info(f"将文件保存到: {file_path}")
+                    
+                    # 保存文件
+                    file_path.write_bytes(response.content)
+                    logger.info(f"文件下载成功，大小: {len(response.content)} bytes")
+                    
+                    audio_content = response.content
+                    
+                    # 保存到缓存
+                    cf = {
+                        "id": int(_id),
+                        "file": str(file_path),
+                        "filename": f"{data['ncm_name']}.{data['type']}",
+                        "from": "song",
+                        "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    }
+                    music.insert(cf)
+                    logger.info("成功保存到缓存数据库")
+                else:
+                    logger.error(f"下载音频失败，状态码: {response.status_code}")
+                    return
+            
+    except Exception as e:
+        logger.error(f"处理音频时发生错误: {repr(e)}")
+        logger.exception(e)
+        return
+
+    # 如果成功获取到音频内容，发送语音消息
+    if audio_content:
+        await search.finish(MessageSegment.record(audio_content))
 
 
 @music_regex.handle()
