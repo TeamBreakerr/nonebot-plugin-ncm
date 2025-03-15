@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-from typing import Tuple, Any, Union, cast
+from typing import Tuple, Any, Union, cast, Optional
 from datetime import datetime
 from pathlib import Path
 
@@ -15,9 +15,67 @@ from nonebot.params import CommandArg, RegexGroup, Arg
 from nonebot.plugin import PluginMetadata
 from nonebot.rule import Rule
 import httpx
+from nonebot_plugin_alconna.builtins.uniseg.music_share import (
+    MusicShare,
+    MusicShareKind,
+)
+from nonebot_plugin_alconna.uniseg import UniMessage
 
 from .config import Config
 from .data_source import nncm, ncm_config, setting, Q, cmd, music
+
+# Constants
+SONG_TIP = "\n使用指令 `direct` 获取播放链接"
+
+class SongInfo:
+    def __init__(self, song_id: int, name: str, artists: list, url: str, audio_url: str, cover_url: str):
+        self.song_id = song_id
+        self.display_name = name
+        self.display_artists = ",".join(artist["name"] for artist in artists)
+        self.url = url
+        self.playable_url = audio_url
+        self.cover_url = cover_url
+
+    @classmethod
+    async def from_song_id(cls, song_id: int) -> "SongInfo":
+        # Get song details from API
+        song_detail = nncm.api.track.GetTrackDetail(song_ids=[song_id])["songs"][0]
+        audio_info = nncm.api.track.GetTrackAudio(song_ids=[song_id], bitrate=ncm_config.ncm_bitrate * 1000)["data"][0]
+        
+        return cls(
+            song_id=song_id,
+            name=song_detail["name"],
+            artists=song_detail["ar"],
+            url=f"https://music.163.com/#/song?id={song_id}",
+            audio_url=audio_info["url"],
+            cover_url=song_detail["al"]["picUrl"]
+        )
+
+    async def get_description(self) -> str:
+        return f"{self.display_name} - {self.display_artists}"
+
+async def sign_music_card(info: SongInfo) -> str:
+    """Sign the music card with the signing service if configured"""
+    if not ncm_config.ncm_card_sign_url:
+        raise ValueError("Card signing URL not configured")
+        
+    async with httpx.AsyncClient(
+        follow_redirects=True,
+        timeout=ncm_config.ncm_card_sign_timeout,
+    ) as cli:
+        body = {
+            "type": "custom",
+            "url": info.url,
+            "audio": info.playable_url,
+            "title": info.display_name,
+            "image": info.cover_url,
+            "singer": info.display_artists,
+        }
+        return (
+            (await cli.post(ncm_config.ncm_card_sign_url, json=body))
+            .raise_for_status()
+            .text
+        )
 
 __plugin_meta__ = PluginMetadata(
     name="网易云无损音乐下载",
@@ -31,12 +89,12 @@ __plugin_meta__ = PluginMetadata(
     homepage="https://github.com/kitUIN/nonebot-plugin-ncm",
     supported_adapters={"~onebot.v11"},
 )
+
 # ========nonebot-plugin-ncm======
 # ===========Constant=============
 TRUE = ["True", "T", "true", "t"]
 FALSE = ["False", "F", "false", "f"]
 ADMIN = ["owner", "admin", "member"]
-
 
 # ===============Rule=============
 async def song_is_open(event: Union[GroupMessageEvent, PrivateMessageEvent]) -> bool:
@@ -54,7 +112,6 @@ async def song_is_open(event: Union[GroupMessageEvent, PrivateMessageEvent]) -> 
         else:
             setting.insert({"user_id": event.user_id, "song": True, "list": True})
             return True
-
 
 async def playlist_is_open(event: Union[GroupMessageEvent, PrivateMessageEvent]) -> bool:
     if isinstance(event, GroupMessageEvent):
@@ -95,31 +152,56 @@ async def music_reply_rule(event: Union[GroupMessageEvent, PrivateMessageEvent])
         return False
 
 # ============Matcher=============
-ncm_set = on_command("ncm",
-                     rule=Rule(music_set_rule),
-                     priority=1, block=False)
-'''功能设置'''
-music_regex = on_regex("(song|url)\?id=([0-9]+)(|&)",
-                       priority=2, block=False)
-'''歌曲id识别'''
-playlist_regex = on_regex("playlist\?id=([0-9]+)&",
-                          priority=2, block=False)
-'''歌单识别'''
-music_reply = on_message(priority=2,
-                         rule=Rule(music_reply_rule),
-                         block=False)
-'''回复下载'''
-search = on_command("点歌",
-                    rule=Rule(check_search),
-                    priority=2, block=False)
-'''点歌'''
-
+ncm_set = on_command("ncm", rule=Rule(music_set_rule), priority=1, block=True)
+music_regex = on_regex("(song|url)\?id=([0-9]+)(|&)", priority=2, block=True)
+playlist_regex = on_regex("playlist\?id=([0-9]+)&", priority=2, block=True)
+music_reply = on_message(rule=Rule(music_reply_rule), priority=2, block=True)
+search = on_command("点歌", rule=Rule(check_search), priority=2, block=True)
 
 @search.handle()
 async def search_receive(matcher: Matcher, args: Message = CommandArg()):
     if args:
         matcher.set_arg("song", args)  # 如果用户发送了参数则直接赋值
 
+async def construct_info_msg(song_info: SongInfo, tip_command: bool = True) -> UniMessage:
+    """Construct an info message for the song"""
+    tip = SONG_TIP if tip_command else ""
+    desc = await song_info.get_description()
+    return UniMessage.image(url=song_info.cover_url) + f"{desc}\n{song_info.url}{tip}"
+
+async def send_song_card_msg(song_info: SongInfo):
+    """Send song as a card message"""
+    if ncm_config.ncm_card_sign_url:
+        return await UniMessage.hyper("json", await sign_music_card(song_info)).send(
+            fallback=False,
+        )
+    
+    return await UniMessage(
+        MusicShare(
+            kind=MusicShareKind.NeteaseCloudMusic,
+            title=song_info.display_name,
+            content=song_info.display_artists,
+            url=song_info.url,
+            thumbnail=song_info.cover_url,
+            audio=song_info.playable_url,
+            summary=song_info.display_artists,
+        ),
+    ).send(fallback=False)
+
+async def send_song(song_info: SongInfo, event):
+    """Send song with fallback options"""
+    receipt = None
+    
+    if ncm_config.ncm_send_as_card:
+        try:
+            receipt = await send_song_card_msg(song_info)
+        except Exception as e:
+            logger.warning(f"Failed to send song card: {e}")
+    
+    if not receipt:
+        receipt = await construct_info_msg(song_info).send(event=event)
+    
+    return receipt
 
 @search.got("song", prompt="要点什么歌捏?")
 async def receive_song(bot: Bot,
@@ -130,15 +212,39 @@ async def receive_song(bot: Bot,
     logger.info(f"收到点歌请求，关键词: {keyword}")
     
     _id = await nncm.search_song(keyword=keyword, limit=1)
+    if not _id:
+        await search.finish("没有找到这首歌呢")
     logger.info(f"搜索到歌曲ID: {_id}")
     
-    # 先发送网易云卡片
-    message_id = await bot.send(event=event, message=Message(MessageSegment.music(type_="163", id_=_id)))
-    nncm.get_song(message_id=message_id["message_id"], nid=_id)
-
-    audio_content = None  # 用于存储音频内容
-
     try:
+        # Get song info and create custom card
+        song_info = await SongInfo.from_song_id(_id)
+        
+        # Send song with fallback options
+        receipt = await send_song(song_info, event)
+        
+        # Get the message id from the receipt
+        try:
+            # Try to get message_id from receipt's message_id attribute
+            message_id = receipt.message_id
+        except AttributeError:
+            try:
+                # Try to get message_id from receipt's data attribute
+                message_id = receipt.data["message_id"]
+            except (AttributeError, KeyError):
+                # If both attempts fail, use event's message_id as fallback
+                message_id = event.message_id
+                logger.warning("Could not get message_id from receipt, using event message_id as fallback")
+        
+        # Store song info in cache
+        nncm.get_song(message_id=message_id, nid=_id)
+
+        # Only proceed with media download if enabled
+        if not ncm_config.ncm_send_media:
+            return
+
+        audio_content = None  # 用于存储音频内容
+
         # 检查缓存
         info = music.search(Q["id"] == _id)
         if info:
@@ -203,17 +309,22 @@ async def receive_song(bot: Bot,
 
     # 如果成功获取到音频内容，发送语音消息
     if audio_content:
-        await search.finish(MessageSegment.record(audio_content))
-
+        try:
+            await bot.send(event=event, message=MessageSegment.record(file=audio_content))
+        except Exception as e:
+            logger.error(f"发送语音消息失败: {e}")
+            # 如果发送失败，尝试上传文件
+            await nncm.upload_data_file(event=event, data={
+                "file": str(file_path),
+                "filename": f"{data['ncm_name']}.{data['type']}"
+            })
 
 @music_regex.handle()
 async def music_receive(bot: Bot, event: Union[GroupMessageEvent, PrivateMessageEvent],
                         regroup: Tuple[Any, ...] = RegexGroup()):
     nid = regroup[1]
     logger.info(f"已识别NID:{nid}的歌曲")
-
     nncm.get_song(nid=nid, message_id=event.message_id)
-
 
 @playlist_regex.handle()
 async def music_list_receive(bot: Bot, event: Union[GroupMessageEvent, PrivateMessageEvent],
@@ -221,7 +332,6 @@ async def music_list_receive(bot: Bot, event: Union[GroupMessageEvent, PrivateMe
     lid = regroup[0]
     logger.info(f"已识别LID:{lid}的歌单")
     nncm.get_playlist(lid=lid, message_id=event.message_id)
-
 
 @music_reply.handle()
 async def music_reply_receive(bot: Bot, event: Union[GroupMessageEvent, PrivateMessageEvent]):
@@ -235,7 +345,6 @@ async def music_reply_receive(bot: Bot, event: Union[GroupMessageEvent, PrivateM
         await bot.send(event=event, message=info["lmsg"] + "\n下载中,上传时间较久,请勿重复发送命令")
         await nncm.music_check(info["ids"], event, info["lid"])
 
-
 @ncm_set.handle()
 async def set_receive(bot: Bot, event: Union[GroupMessageEvent, PrivateMessageEvent],
                       args: Message = CommandArg()):  # 功能设置接收
@@ -246,7 +355,6 @@ async def set_receive(bot: Bot, event: Union[GroupMessageEvent, PrivateMessageEv
             mold = args[0]
             if isinstance(event, GroupMessageEvent):
                 info = setting.search(Q["group_id"] == event.group_id)
-                # logger.info(info)
                 if info:
                     if mold in TRUE:
                         info[0]["song"] = True
@@ -268,7 +376,6 @@ async def set_receive(bot: Bot, event: Union[GroupMessageEvent, PrivateMessageEv
                         setting.insert({"group_id": event.group_id, "song": False, "list": False})
             elif isinstance(event, PrivateMessageEvent):
                 info = setting.search(Q["user_id"] == event.user_id)
-                # logger.info(info)
                 if info:
                     if mold in TRUE:
                         info[0]["song"] = True
@@ -312,7 +419,6 @@ async def set_receive(bot: Bot, event: Union[GroupMessageEvent, PrivateMessageEv
             qq = args[1]
             mold = args[2]
             info = setting.search(Q["user_id"] == qq)
-            # logger.info(info)
             if info:
                 if mold in TRUE:
                     info[0]["song"] = True
@@ -335,4 +441,4 @@ async def set_receive(bot: Bot, event: Union[GroupMessageEvent, PrivateMessageEv
     else:
         msg = f"{cmd}ncm:获取命令菜单\r\n说明:网易云歌曲分享到群内后回复机器人即可下载\r\n" \
               f"{cmd}ncm t:开启解析\r\n{cmd}ncm f:关闭解析\n{cmd}点歌 歌名:点歌"
-        return await ncm_set.finish(message=MessageSegment.text(msg))
+        await ncm_set.finish(message=MessageSegment.text(msg))

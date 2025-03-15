@@ -22,6 +22,18 @@ class Config(BaseModel, extra=Extra.ignore):
     ncm_bitrate: int = 320
     '''下载码率(单位K) 96及以下为m4a,320及以上为flac,中间mp3'''
 
+    ncm_card_sign_url: Optional[str] = None
+    '''音乐卡片签名服务URL'''
+
+    ncm_card_sign_timeout: int = 10
+    '''音乐卡片签名超时时间(秒)'''
+
+    ncm_send_as_card: bool = True
+    '''是否以卡片形式发送音乐'''
+
+    ncm_send_media: bool = True
+    '''是否发送媒体文件'''
+
 
 global_config = nonebot.get_driver().config
 ncm_config = Config(**global_config.dict())  # 载入配置
