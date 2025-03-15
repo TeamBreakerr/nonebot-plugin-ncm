@@ -307,17 +307,26 @@ async def receive_song(bot: Bot,
         logger.exception(e)
         return
 
-    # 如果成功获取到音频内容，发送语音消息
+    # 如果成功获取到音频内容，先发送封面，再发送语音消息
     if audio_content:
         try:
+            # 发送歌曲封面
+            async with httpx.AsyncClient() as client:
+                cover_response = await client.get(song_info.cover_url)
+                if cover_response.status_code == 200:
+                    await bot.send(event=event, message=MessageSegment.image(cover_response.content))
+            # 发送语音消息
             await bot.send(event=event, message=MessageSegment.record(file=audio_content))
         except Exception as e:
-            logger.error(f"发送语音消息失败: {e}")
+            logger.error(f"发送消息失败: {e}")
             # 如果发送失败，尝试上传文件
-            await nncm.upload_data_file(event=event, data={
-                "file": str(file_path),
-                "filename": f"{data['ncm_name']}.{data['type']}"
-            })
+            if 'data' in locals() and 'file_path' in locals():
+                await nncm.upload_data_file(event=event, data={
+                    "file": str(file_path),
+                    "filename": f"{data['ncm_name']}.{data['type']}"
+                })
+            else:
+                logger.error("无法上传文件：缺少必要的文件信息")
 
 @music_regex.handle()
 async def music_receive(bot: Bot, event: Union[GroupMessageEvent, PrivateMessageEvent],
