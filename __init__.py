@@ -4,7 +4,7 @@ from typing import Tuple, Any, Union, cast, Optional
 from datetime import datetime
 from pathlib import Path
 
-from nonebot import on_regex, on_command, on_message
+from nonebot import on_regex, on_command, on_message, require
 from nonebot.adapters.onebot.v11 import (Message, Bot,
                                          MessageSegment,
                                          GroupMessageEvent,
@@ -23,6 +23,11 @@ from nonebot_plugin_alconna.uniseg import UniMessage
 
 from .config import Config
 from .data_source import nncm, ncm_config, setting, Q, cmd, music
+from .utils import render_lyrics_to_pic
+
+# For lyrics rendering
+require("nonebot_plugin_htmlrender")
+from nonebot_plugin_htmlrender import text_to_pic
 
 # Constants
 SONG_TIP = "\n使用指令 `direct` 获取播放链接"
@@ -151,11 +156,22 @@ async def music_reply_rule(event: Union[GroupMessageEvent, PrivateMessageEvent])
     except Exception:
         return False
 
+async def lyrics_reply_rule(event: Union[GroupMessageEvent, PrivateMessageEvent]) -> bool:
+    try:
+        # Check if it's a reply with "歌词" text
+        is_lyrics_reply = bool(event.reply and event.get_plaintext().strip() == "歌词")
+        # logger.info(f"检查是否为歌词回复请求: {is_lyrics_reply}")
+        return is_lyrics_reply
+    except Exception as e:
+        logger.error(f"检查歌词回复规则时出错: {repr(e)}")
+        return False
+
 # ============Matcher=============
 ncm_set = on_command("ncm", rule=Rule(music_set_rule), priority=1, block=True)
 music_regex = on_regex("(song|url)\?id=([0-9]+)(|&)", priority=2, block=True)
 playlist_regex = on_regex("playlist\?id=([0-9]+)&", priority=2, block=True)
 music_reply = on_message(rule=Rule(music_reply_rule), priority=2, block=True)
+lyrics_reply = on_message(rule=Rule(lyrics_reply_rule), priority=2, block=True)
 search = on_command("点歌", rule=Rule(check_search), priority=2, block=True)
 
 @search.handle()
@@ -353,6 +369,112 @@ async def music_reply_receive(bot: Bot, event: Union[GroupMessageEvent, PrivateM
     elif info["type"] == "playlist" and await playlist_is_open(event):
         await bot.send(event=event, message=info["lmsg"] + "\n下载中,上传时间较久,请勿重复发送命令")
         await nncm.music_check(info["ids"], event, info["lid"])
+
+@lyrics_reply.handle()
+async def lyrics_reply_receive(bot: Bot, event: Union[GroupMessageEvent, PrivateMessageEvent]):
+    logger.info(f"歌词回复处理开始, message_id: {event.message_id}")
+    
+    try:
+        reply_msg_id = int(event.dict()["reply"]["message_id"])
+        logger.info(f"获取到回复消息ID: {reply_msg_id}")
+        
+        # 尝试从缓存获取歌曲信息
+        info = nncm.check_message(reply_msg_id)
+        song_id = None
+        
+        # 如果在缓存中找到了信息
+        if info is not None and info["type"] == "song":
+            song_id = info["nid"]
+            logger.info(f"从缓存中找到歌曲ID: {song_id}")
+        
+        # 如果缓存中没有找到，尝试从原消息中提取歌曲ID（作为备选方案）
+        if song_id is None:
+            try:
+                # 获取被回复的消息内容
+                reply_msg = await bot.get_msg(message_id=reply_msg_id)
+                if reply_msg and "message" in reply_msg:
+                    message_content = reply_msg["message"]
+                    logger.info(f"获取到原始消息内容: {message_content}")
+                    
+                    # 尝试从消息中提取歌曲ID
+                    import re
+                    song_match = re.search(r'song\?id=(\d+)', str(message_content))
+                    if song_match:
+                        song_id = int(song_match.group(1))
+                        logger.info(f"从消息中直接提取到歌曲ID: {song_id}")
+                    else:
+                        logger.info("未能从消息中提取到歌曲ID")
+            except Exception as e:
+                logger.error(f"尝试从消息中提取歌曲ID时出错: {repr(e)}")
+        
+        # 如果仍然没有找到歌曲ID，退出处理
+        if song_id is None:
+            logger.info("未找到相关歌曲信息，退出处理")
+            await bot.send(event=event, message="未能识别出歌曲信息，请确保回复的是音乐卡片")
+            return
+        
+        # 开始处理歌词
+        logger.info(f"找到歌曲ID: {song_id}, 开始获取歌词")
+        await bot.send(event=event, message="获取歌词中...")
+        
+        try:
+            # Get lyrics using pyncm
+            logger.info(f"调用API获取歌词: song_id={song_id}")
+            lyrics_data = nncm.api.track.GetTrackLyrics(song_id=song_id)
+            logger.info(f"歌词API返回结果: {lyrics_data.keys() if lyrics_data else None}")
+            
+            # Check if lyrics exist
+            if not lyrics_data or "lrc" not in lyrics_data or not lyrics_data["lrc"].get("lyric"):
+                logger.info("未找到歌词内容")
+                await bot.send(event=event, message="未找到歌词")
+                return
+                
+            # Get original lyrics
+            original_lyrics = lyrics_data["lrc"]["lyric"]
+            logger.info(f"成功获取原文歌词，长度: {len(original_lyrics)}")
+            
+            # Get translated lyrics if available
+            translation = None
+            if "tlyric" in lyrics_data and lyrics_data["tlyric"].get("lyric"):
+                translation = lyrics_data["tlyric"]["lyric"]
+                logger.info(f"成功获取翻译歌词，长度: {len(translation)}")
+            
+            # Get romaji lyrics if available
+            romaji = None
+            if "romalrc" in lyrics_data and lyrics_data["romalrc"].get("lyric"):
+                romaji = lyrics_data["romalrc"]["lyric"]
+                logger.info(f"成功获取罗马音歌词，长度: {len(romaji)}")
+            
+            # Get song info for title
+            logger.info(f"获取歌曲详情: song_id={song_id}")
+            song_detail = nncm.api.track.GetTrackDetail(song_ids=[song_id])["songs"][0]
+            song_name = song_detail["name"]
+            artists = ",".join(artist["name"] for artist in song_detail["ar"])
+            
+            # Render lyrics as image with all available translations
+            logger.info("开始渲染歌词图片")
+            pic = await render_lyrics_to_pic(
+                title=song_name, 
+                artist=artists, 
+                lyrics=original_lyrics, 
+                translation=translation,
+                romaji=romaji
+            )
+            logger.info(f"图片渲染完成，大小: {len(pic) if pic else 0} bytes")
+            
+            # Send image
+            logger.info("发送歌词图片")
+            await bot.send(event=event, message=MessageSegment.image(pic))
+            logger.info("歌词处理完成")
+            
+        except Exception as e:
+            logger.error(f"获取歌词失败: {repr(e)}")
+            logger.exception(e)
+            await bot.send(event=event, message=f"获取歌词失败: {str(e)}")
+    except Exception as e:
+        logger.error(f"处理歌词请求时发生错误: {repr(e)}")
+        logger.exception(e)
+        await bot.send(event=event, message=f"处理歌词请求失败: {str(e)}")
 
 @ncm_set.handle()
 async def set_receive(bot: Bot, event: Union[GroupMessageEvent, PrivateMessageEvent],

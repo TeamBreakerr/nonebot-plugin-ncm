@@ -1,0 +1,64 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{% block title %}网易云音乐{% endblock %}</title>
+    <style>
+        body {
+            margin: 0;
+            padding: 0;
+            background-color: #f5f5f5;
+            font-family: "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+            display: flex;
+            justify-content: center;
+            padding: 20px;
+        }
+        main {
+            padding: 30px;
+            background-color: white;
+            box-shadow: 0 2px 10px rgba(0, 0, 0, 0.1);
+            border-radius: 8px;
+            display: flex;
+            flex-direction: column;
+        }
+        .footer {
+            margin-top: 30px;
+            font-size: 12px;
+            color: #999;
+            padding-top: 20px;
+            border-top: 1px solid #eaeaea;
+        }
+        .text-center {
+            text-align: center;
+        }
+        .song-header {
+            text-align: center;
+            margin-bottom: 30px;
+            padding-bottom: 20px;
+            border-bottom: 1px solid #eaeaea;
+        }
+        .song-title {
+            font-size: 24px;
+            color: #333;
+            margin-bottom: 10px;
+            font-weight: bold;
+        }
+        .song-artist {
+            font-size: 16px;
+            color: #666;
+        }
+        {% block style %}{% endblock %}
+    </style>
+    {% block head %}{% endblock %}
+</head>
+<body>
+    <main>
+        <div class="song-header">
+            <div class="song-title">{{ song_title }}</div>
+            <div class="song-artist">{{ song_artist }}</div>
+        </div>
+        {% block main %}{% endblock %}
+    </main>
+</body>
+</html> 

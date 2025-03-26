@@ -186,8 +186,25 @@ class Ncm:
         """检查缓存中是否存在解析
         :return:
         """
-        flag = ncm_check_cache.search(Q.message_id == message_id)
-        return flag[0] if flag else None
+        try:
+            logger.info(f"检查消息缓存: message_id={message_id}")
+            flag = ncm_check_cache.search(Q.message_id == message_id)
+            logger.info(f"缓存查询结果: {flag}")
+            
+            # 打印当前缓存记录总数
+            all_records = len(ncm_check_cache.all())
+            logger.info(f"当前缓存中共有 {all_records} 条记录")
+            
+            # 如果未找到，尝试显示几条最近的记录用于诊断
+            if not flag and all_records > 0:
+                recent = sorted(ncm_check_cache.all(), key=lambda x: x.get("time", 0), reverse=True)[:3]
+                logger.info(f"最近的几条缓存记录: {recent}")
+                
+            return flag[0] if flag else None
+        except Exception as e:
+            logger.error(f"检查消息缓存时发生错误: {repr(e)}")
+            logger.exception(e)
+            return None
 
     @staticmethod
     def get_song(nid: int, message_id: int):
