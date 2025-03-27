@@ -26,7 +26,6 @@ from .data_source import nncm, ncm_config, setting, Q, cmd, music
 from .utils import render_lyrics_to_pic
 
 # For lyrics rendering
-require("nonebot_plugin_htmlrender")
 from nonebot_plugin_htmlrender import text_to_pic
 
 # Constants
