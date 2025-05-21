@@ -214,7 +214,10 @@ async def send_song(song_info: SongInfo, event):
             logger.warning(f"Failed to send song card: {e}")
     
     if not receipt:
-        receipt = await construct_info_msg(song_info).send(event=event)
+        # First create the message
+        info_msg = await construct_info_msg(song_info)
+        # Then send it without the event parameter
+        receipt = await info_msg.send()
     
     return receipt
 
